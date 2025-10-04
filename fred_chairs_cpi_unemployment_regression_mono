@@ -1,0 +1,161 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+
+"""
+Joint KDE of CPI vs Unemployment – all Fed Chairs overlapped.
+A colour legend shows the chair name + tenure for every contour set.
+"""
+
+# ------------------------------------------------------------------
+#  Imports
+# ------------------------------------------------------------------
+import requests, pandas as pd, numpy as np
+from datetime import datetime
+
+from sklearn.linear_model import LinearRegression
+import matplotlib.pyplot as plt
+import matplotlib.ticker as mtick
+import seaborn as sns
+
+# ------------------------------------------------------------------
+#  API key – put your own key in a file called fred_key.py
+# ------------------------------------------------------------------
+try:
+    from fred_key import fred_key          # <-- adjust if you named it differently
+except Exception:  # pragma: no cover
+    raise RuntimeError(
+        "Could not load your FRED key.\n"
+        "Create a file called `fred_key.py` with:\n\n"
+        "    fred_key = \"YOUR_ACTUAL_KEY\"\n"
+        "or set the variable directly below."
+    )
+
+# ------------------------------------------------------------------
+#  Helper: generic request wrapper
+# ------------------------------------------------------------------
+BASE_URL = "https://api.stlouisfed.org/fred/"
+
+def fred_get(endpoint: str, params: dict) -> requests.Response:
+    if "api_key" not in params:
+        params["api_key"] = fred_key
+    resp = requests.get(BASE_URL + endpoint, params=params)
+    resp.raise_for_status()
+    return resp
+
+# ------------------------------------------------------------------
+#  Pull CPI (YoY%) & Unemployment (linear %) for the period you care about
+# ------------------------------------------------------------------
+start_date = "1990-01-01"
+end_date   = datetime.today().strftime("%Y-%m-%d")
+
+def pull_series(series_id, units, freq="m"):
+    params = {
+        "series_id": series_id,
+        "observation_start": start_date,
+        "observation_end": end_date,
+        "frequency": freq,
+        "units": units,
+        "file_type": "json",
+    }
+    resp   = fred_get("series/observations", params)
+    df     = pd.DataFrame(resp.json()["observations"])
+    df["date"] = pd.to_datetime(df["date"])
+    df.set_index("date", inplace=True)
+    df["value"] = df["value"].astype(float)
+    return df
+
+cpi_df  = pull_series("CPIAUCSL", "pc1")   # percent change YoY
+unemp_df= pull_series("UNRATE",   "lin")   # linear %
+
+# ------------------------------------------------------------------
+#  Merge into a single DataFrame
+# ------------------------------------------------------------------
+merged = pd.merge(cpi_df, unemp_df,
+                 left_index=True, right_index=True,
+                 suffixes=("_cpi","_unemp")).dropna()
+
+merged.rename(columns={"value_cpi":"CPI YoY %", "value_unemp":"Unemployment %"},
+              inplace=True)
+
+# ------------------------------------------------------------------
+#  Load the Fed Chair tenure table
+# ------------------------------------------------------------------
+chair_df = pd.DataFrame({
+    'startd_date': ['1914-08-10','1916-08-10','1923-05-01','1927-10-04',
+                    '1930-09-16','1933-05-19','1934-11-15','1948-04-15',
+                    '1951-04-02','1970-02-01','1978-03-08','1979-08-06',
+                    '1987-08-11','2006-02-01','2014-02-03','2018-02-05'],
+    'end_date':    ['1916-08-09','1922-08-09','1927-09-15','1930-08-31',
+                    '1933-05-10','1934-08-15','1948-01-31','1951-03-31',
+                    '1970-01-31','1978-01-31','1979-08-06','1987-08-11',
+                    '2006-01-31','2014-01-31','2018-02-03',None],
+    'name': ['Charles S. Hamlin','W.P.G. Harding','Daniel R. Crissinger','Roy A. Young',
+             'Eugene Meyer','Eugene R. Black','Marriner S. Eccles','Thomas B. McCabe',
+             'William McChesney Martin, Jr.','Arthur F. Burns','G. William Miller',
+             'Paul A. Volcker','Alan Greenspan','Ben S. Bernanke',
+             'Janet L. Yellen','Jerome H. Powell']
+})
+chair_df['startd_date'] = pd.to_datetime(chair_df['startd_date'])
+chair_df['end_date']   = pd.to_datetime(chair_df['end_date'])
+
+# ------------------------------------------------------------------
+#  One scatter plot + KDE for every chair
+# ------------------------------------------------------------------
+sns.set_theme(style="ticks")
+
+fig, ax = plt.subplots(figsize=(8, 6))
+
+# Colour palette – one hue per chair
+palette = sns.color_palette("tab10", n_colors=len(chair_df))
+
+for (idx, row), col in zip(chair_df.iterrows(), palette):
+    # ------------------------------------------------------------------
+    #  Slice the data for this chair’s tenure
+    # ------------------------------------------------------------------
+    mask  = (merged.index >= row['startd_date']) & \
+            ((merged.index <= row['end_date']) | pd.isna(row['end_date']))
+    data  = merged.loc[mask]
+
+    if data.empty:
+        continue
+
+    # ------------------------------------------------------------------
+    #  Scatter the raw observations
+    # ------------------------------------------------------------------
+    sns.scatterplot(
+        x=data["CPI YoY %"],
+        y=data["Unemployment %"],
+        ax=ax,
+        color=col,
+        s=20,                     # point size
+        alpha=0.6,
+        label=f"{row['name']}  ({row['startd_date'].date()}–"
+              f"{'present' if pd.isna(row['end_date']) else row['end_date'].date()})",
+    )
+
+    # ------------------------------------------------------------------
+    #  KDE contour (unfilled, same colour)
+    # ------------------------------------------------------------------
+    sns.kdeplot(
+        x=data["CPI YoY %"],
+        y=data["Unemployment %"],
+        ax=ax,
+        levels=5,
+        fill=False,
+        linewidth=1.2,
+        color=col,
+        alpha=0.9
+    )
+
+# ------------------------------------------------------------------
+#  Final touches – axis labels, title, legend inside plot
+# ------------------------------------------------------------------
+ax.set_xlabel("CPI YoY %")
+ax.set_ylabel("Unemployment %")
+ax.set_title("Scatter + KDE of CPI vs Unemployment – all Fed Chairs overlapped")
+
+# Place the legend in the upper‑right corner *inside* the axes.
+ax.legend(bbox_to_anchor=(1, 1), loc='upper left', borderaxespad=0)
+
+plt.tight_layout()
+plt.show()
