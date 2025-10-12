@@ -1,2 +1,2 @@
-# fredAPI
-Get Economic Data From The FRED API
+# fred
+Economic and financial market data for research
