@@ -1,0 +1,290 @@
+#!/usr/bin/env python
+# -*- coding: utf-8 -*-
+
+"""
+gold_and_cpi.py
+
+Pulls daily gold price data from Yahoo Finance and CPI year‑on‑year data from a local SQL Server instance.
+Adjusts the gold price for inflation, computes the YoY change, merges everything into one DataFrame,
+and finally plots Gold vs. CPI YoY with shaded comparison area.
+
+Author:  <your name>
+Date:    <date>
+"""
+
+# ------------------------------------------------------------------
+# Imports
+# ------------------------------------------------------------------
+import pandas as pd
+import yfinance as yf
+import pyodbc
+from datetime import datetime
+
+import matplotlib.pyplot as plt
+import matplotlib.dates as mdates
+
+
+# ------------------------------------------------------------------
+# -------------------- Part 1 – Yahoo Finance helpers --------------------
+# ------------------------------------------------------------------
+
+def _try_yahoo_history(ticker: str) -> pd.DataFrame | None:
+    """Try to fetch daily history for a Yahoo ticker.
+    Returns a DataFrame with a DatetimeIndex and a single column
+    called 'price_usd' (Adj Close if available, otherwise Close)."""
+    try:
+        t = yf.Ticker(ticker)
+        df = t.history(period="max", interval="1d",
+                       auto_adjust=True, actions=False)
+
+        if df is None or df.empty:
+            return None
+
+        # Prefer Adjusted close; fallback to raw close
+        col = "Adj Close" if "Adj Close" in df.columns else (
+              "Close" if "Close" in df.columns else None)
+        if not col:
+            return None
+
+        out = df[[col]].rename(columns={col: "price_usd"}).dropna()
+        out.index = pd.to_datetime(out.index).tz_localize(None)  # strip tz
+        return out.sort_index()
+
+    except Exception:
+        return None
+
+
+def fetch_gold_history(prefer_yahoo_only: bool = True) -> pd.DataFrame:
+    """Fetch historical gold prices from Yahoo Finance.
+    Tries the following tickers in order and picks the one with the earliest start date."""
+    yahoo_candidates = [
+        ("GC=F",  "COMEX Gold Futures (Continuous)"),
+        ("MGC=F", "Micro Gold Futures"),
+        ("GLD",   "SPDR Gold Shares ETF"),
+        ("IAU",   "iShares Gold Trust"),
+        ("SGOL",  "Aberdeen Standard Physical Gold Shares"),
+    ]
+
+    best_df = None
+    best_meta = None
+
+    for ticker, label in yahoo_candidates:
+        df = _try_yahoo_history(ticker)
+        if df is None:
+            continue
+        if best_df is None or df.index.min() < best_df.index.min():
+            best_df = df
+            best_meta = (ticker, label)
+
+    if best_df is not None:
+        ticker, label = best_meta
+        print(
+            f"Using {label} [{ticker}] from {best_df.index.min().date()} "
+            f"to {best_df.index.max().date()} ({len(best_df):,} rows)."
+        )
+        return best_df
+
+    if prefer_yahoo_only:
+        raise RuntimeError(
+            "Yahoo Finance returned no data for GC=F, MGC=F, GLD, IAU, or SGOL. "
+            "This may be due to network or regional restrictions."
+        )
+
+    # Optional FRED fallback
+    try:
+        from pandas_datareader import data as pdr
+        fred = pdr.DataReader("GOLDAMGBD228NLBM", "fred")
+        fred = fred.rename(columns={"GOLDAMGBD228NLBM": "price_usd"}).dropna()
+        fred.index = pd.to_datetime(fred.index)
+        return fred.sort_index()
+    except Exception as e:
+        raise RuntimeError(
+            "No Yahoo data found, and FRED fallback also failed. "
+            "Check internet access or update yfinance."
+        ) from e
+
+
+# ------------------------------------------------------------------
+# -------------------- Part 2 – SQL Server CPI data --------------------
+# ------------------------------------------------------------------
+
+def fetch_cpi_yoy_from_sql() -> pd.DataFrame:
+    """Connects to the local/remote SQL Server instance using Windows auth
+    and pulls the CPI YoY series from [Main].[fred].[F_C_CPI_YoY]."""
+    # Connection string – adjust `server` and `database` if needed.
+    server = r'Don_PC\SQLEXPRESS'
+    database = 'Main'
+
+    conn_str = (
+        r'DRIVER={ODBC Driver 17 for SQL Server};'
+        f'SERVER={server};'
+        f'DATABASE={database};'
+        'Trusted_Connection=yes;'
+    )
+
+    query = """
+        SELECT
+            date,
+            value
+        FROM Main.fred.F_C_CPI_YoY
+        WHERE date IS NOT NULL
+          AND value IS NOT NULL
+        ORDER BY Date
+    """
+
+    try:
+        with pyodbc.connect(conn_str) as conn, conn.cursor() as cur:
+            df = pd.read_sql(query, conn)
+            if df.empty:
+                raise ValueError("CPI table returned no rows")
+            # Ensure the index is datetime and column is numeric
+            df['date'] = pd.to_datetime(df['date'])
+            df.set_index('date', inplace=True)
+            df.rename(columns={'value': 'cpi_yoy'}, inplace=True)
+            df = df.astype({'cpi_yoy': float})
+            return df.sort_index()
+    except Exception as exc:
+        raise RuntimeError(f"Failed to read CPI data from SQL Server: {exc}") from exc
+
+
+# ------------------------------------------------------------------
+# -------------------- Part 3 – Inflation adjustment --------------------
+# ------------------------------------------------------------------
+
+def build_cpi_inflation_factor(cpi_yoy_df: pd.DataFrame) -> pd.Series:
+    """Convert a YoY percentage series into a cumulative inflation factor."""
+    growth_multiplier = 1 + cpi_yoy_df['cpi_yoy'] / 100
+    inflation_factor = growth_multiplier.cumprod()
+    inflation_factor /= inflation_factor.iloc[0]          # base‑year = 1
+    return inflation_factor
+
+
+def adjust_prices_for_inflation(gold_df: pd.DataFrame,
+                               inflation_factor: pd.Series) -> pd.DataFrame:
+    """Multiply each gold price by the corresponding cumulative CPI factor."""
+    aligned = pd.DataFrame({
+        'price_usd': gold_df['price_usd'],
+        'cpi_factor': inflation_factor
+    }).dropna()
+
+    aligned['price_adj'] = aligned['price_usd'] * aligned['cpi_factor']
+    return aligned
+
+
+# ------------------------------------------------------------------
+# -------------------- Part 4 – Year‑on‑Year change --------------------
+# ------------------------------------------------------------------
+
+def compute_gold_yoy_change(adjusted_df: pd.DataFrame) -> pd.Series:
+    """Compute the year‑on‑year percentage change of the inflation‑adjusted
+    gold price (compare each day to the same calendar date one year earlier)."""
+    df = adjusted_df.copy()
+    df.index = pd.to_datetime(df.index)
+
+    shifted = df['price_adj'].shift(1, freq=pd.DateOffset(years=1))
+    yoy_change_pct = (df['price_adj'] / shifted - 1) * 100
+    return yoy_change_pct
+
+
+# ------------------------------------------------------------------
+# -------------------- Part 5 – Plotting ---------------------------------
+# ------------------------------------------------------------------
+
+def plot_cpi_vs_gold_yoy(df: pd.DataFrame):
+    """Draw a line chart comparing CPI YoY and Gold YoY with shaded area."""
+    fig, ax = plt.subplots(figsize=(12, 6))
+
+    # CPI YoY – solid black
+    ax.plot(df.index, df['cpi_yoy'], label='CPI YoY', color='black',
+            linewidth=1.5)
+
+    # Gold YoY (inflation‑adjusted) – dotted blue
+    ax.plot(df.index, df['gold_yoy'],
+            label='Gold YoY (inflation‑adjusted)',
+            color='blue', linestyle='dotted', linewidth=1.5)
+
+    # Shade the area between the two series
+    ax.fill_between(
+        df.index,
+        df['cpi_yoy'],
+        df['gold_yoy'],
+        where=(df['gold_yoy'] >= df['cpi_yoy']),
+        interpolate=True,
+        color='green',
+        alpha=0.4,
+        label='Gold > CPI'
+    )
+    ax.fill_between(
+        df.index,
+        df['cpi_yoy'],
+        df['gold_yoy'],
+        where=(df['gold_yoy'] < df['cpi_yoy']),
+        interpolate=True,
+        color='red',
+        alpha=0.4,
+        label='Gold < CPI'
+    )
+
+    # Formatting
+    ax.set_title('Year‑on‑Year Change: Gold vs CPI (Inflation‑Adjusted)', fontsize=14)
+    ax.set_xlabel('Date')
+    ax.set_ylabel('YoY %')
+    ax.grid(True, which='both', linestyle='--', linewidth=0.5)
+
+    # X‑axis date formatting
+    ax.xaxis.set_major_locator(mdates.YearLocator(1))
+    ax.xaxis.set_major_formatter(mdates.DateFormatter('%Y'))
+    fig.autofmt_xdate()
+
+    # Legend outside the plot area
+    ax.legend(loc='center left', bbox_to_anchor=(1, 0.5))
+
+    plt.tight_layout()
+    plt.show()
+
+
+# ------------------------------------------------------------------
+# -------------------- Part 6 – Main ------------------------------------
+# ------------------------------------------------------------------
+
+def main():
+    # Pull data
+    gold_df = fetch_gold_history(prefer_yahoo_only=True)
+    cpi_df = fetch_cpi_yoy_from_sql()
+
+    # Merge on the DatetimeIndex (inner join → only dates present in both series)
+    merged = pd.merge(gold_df, cpi_df,
+                      left_index=True, right_index=True,
+                      how='inner')
+
+    # Build cumulative CPI factor and adjust gold for inflation
+    inflation_factor = build_cpi_inflation_factor(merged[['cpi_yoy']])
+    adjusted = adjust_prices_for_inflation(merged[['price_usd']], inflation_factor)
+
+    # Compute year‑on‑year change of the inflation‑adjusted price
+    yoy_change_pct = compute_gold_yoy_change(adjusted)
+    adjusted['gold_yoy'] = yoy_change_pct
+
+    # Final DataFrame (date index, CPI YoY, Gold YoY & price_adj)
+    final_df = pd.concat([adjusted, merged['cpi_yoy']], axis=1)
+    final_df.index.name = 'date'
+    final_df.sort_index(inplace=True)
+
+    # ------------------------------------------------------------------
+    # Display a quick summary
+    # ------------------------------------------------------------------
+    print("\nInflation‑adjusted gold prices with YoY change:")
+    print(f"Total rows: {len(final_df)}")
+    print("First 10 rows:\n", final_df.head(10))
+    print("\nLast 10 rows:\n", final_df.tail(10))
+
+    # ------------------------------------------------------------------
+    # Plot the CPI vs Gold YoY comparison
+    # ------------------------------------------------------------------
+    plot_cpi_vs_gold_yoy(final_df)
+
+    return final_df
+
+
+if __name__ == "__main__":
+    main()
