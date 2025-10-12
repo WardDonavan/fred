@@ -139,7 +139,7 @@ for ax, (idx, row) in zip(axes, chair_df.iterrows()):
     date_nums = data.index.map(pd.Timestamp.toordinal).astype(float)
 
     norm = plt.Normalize(vmin=date_nums.min(), vmax=date_nums.max())
-    cmap = plt.cm.viridis   # you can pick any sequential cmap you like
+    cmap = plt.cm.viridis_r   # reversed viridis colormap
 
     scatter = ax.scatter(
         data["CPI YoY %"],
